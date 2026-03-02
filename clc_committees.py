@@ -1362,63 +1362,50 @@ def render_schedule_tab(committee):
             }
             ROLES = ["Member","Chair","Deputy Chair","Secretary","Observer"]
 
-            # Group staff by program for easier scanning
-            prog_order  = {"JP": "Junior Primary", "PY": "Primary Years",
-                           "SY": "Senior Years",   None: "Other / Leadership"}
-            by_prog = {}
+            # List all staff alphabetically (staff_list has no program column)
             for s in all_staff:
-                prog = s.get("program") or None
-                by_prog.setdefault(prog, []).append(s)
+                sid    = s["id"]
+                sname  = s["name"]
+                semail = s.get("email", "")
+                is_member = sid in membership
+                cur_role  = membership.get(sid, "Member")
+                rc, rb = ROLE_COLORS.get(cur_role, ROLE_COLORS["Member"])
 
-            for prog_key in [None, "JP", "PY", "SY"]:
-                group = by_prog.get(prog_key, [])
-                if not group:
-                    continue
-                prog_label = prog_order.get(prog_key, prog_key or "Other")
-                st.markdown(f"**{prog_label}**")
-                for s in group:
-                    sid   = s["id"]
-                    sname = s["name"]
-                    semail= s.get("email","")
-                    is_member = sid in membership
-                    cur_role  = membership.get(sid, "Member")
-                    rc, rb = ROLE_COLORS.get(cur_role, ROLE_COLORS["Member"])
-
-                    col_check, col_info, col_role, col_save = st.columns([0.5, 4, 2, 1])
-                    with col_check:
-                        ticked = st.checkbox("", value=is_member,
-                                             key=f"mem_tick_{committee}_{sid}",
-                                             label_visibility="collapsed")
-                    with col_info:
-                        badge = f'<span style="background:{rb};color:{rc};font-size:0.68rem;font-weight:700;padding:0.1rem 0.45rem;border-radius:20px;">{cur_role}</span> ' if is_member else ""
-                        st.markdown(
-                            f'<div style="padding:0.35rem 0;font-size:0.88rem;">'
-                            f'{badge}<strong>{sname}</strong>'
-                            f'<span style="color:#888;font-size:0.78rem;margin-left:0.5rem;">✉️ {semail}</span>'
-                            f'</div>', unsafe_allow_html=True)
-                    with col_role:
-                        if ticked:
-                            new_role = st.selectbox("", ROLES,
-                                                    index=ROLES.index(cur_role) if cur_role in ROLES else 0,
-                                                    key=f"mem_role_{committee}_{sid}",
-                                                    label_visibility="collapsed")
-                        else:
-                            new_role = "Member"
-                            st.empty()
-                    with col_save:
-                        st.write("")
-                        if ticked and not is_member:
-                            if st.button("➕", key=f"mem_add_{committee}_{sid}", help=f"Add {sname}"):
-                                db_set_committee_membership(committee, sid, new_role)
-                                st.rerun()
-                        elif ticked and is_member and new_role != cur_role:
-                            if st.button("💾", key=f"mem_save_{committee}_{sid}", help="Save role"):
-                                db_set_committee_membership(committee, sid, new_role)
-                                st.rerun()
-                        elif not ticked and is_member:
-                            if st.button("✖", key=f"mem_rem_{committee}_{sid}", help=f"Remove {sname}"):
-                                db_remove_committee_membership(committee, sid)
-                                st.rerun()
+                col_check, col_info, col_role, col_save = st.columns([0.5, 4, 2, 1])
+                with col_check:
+                    ticked = st.checkbox("", value=is_member,
+                                         key=f"mem_tick_{committee}_{sid}",
+                                         label_visibility="collapsed")
+                with col_info:
+                    badge = f'<span style="background:{rb};color:{rc};font-size:0.68rem;font-weight:700;padding:0.1rem 0.45rem;border-radius:20px;">{cur_role}</span> ' if is_member else ""
+                    st.markdown(
+                        f'<div style="padding:0.35rem 0;font-size:0.88rem;">'
+                        f'{badge}<strong>{sname}</strong>'
+                        f'<span style="color:#888;font-size:0.78rem;margin-left:0.5rem;">✉️ {semail}</span>'
+                        f'</div>', unsafe_allow_html=True)
+                with col_role:
+                    if ticked:
+                        new_role = st.selectbox("", ROLES,
+                                                index=ROLES.index(cur_role) if cur_role in ROLES else 0,
+                                                key=f"mem_role_{committee}_{sid}",
+                                                label_visibility="collapsed")
+                    else:
+                        new_role = "Member"
+                        st.empty()
+                with col_save:
+                    st.write("")
+                    if ticked and not is_member:
+                        if st.button("➕", key=f"mem_add_{committee}_{sid}", help=f"Add {sname}"):
+                            db_set_committee_membership(committee, sid, new_role)
+                            st.rerun()
+                    elif ticked and is_member and new_role != cur_role:
+                        if st.button("💾", key=f"mem_save_{committee}_{sid}", help="Save role"):
+                            db_set_committee_membership(committee, sid, new_role)
+                            st.rerun()
+                    elif not ticked and is_member:
+                        if st.button("✖", key=f"mem_rem_{committee}_{sid}", help=f"Remove {sname}"):
+                            db_remove_committee_membership(committee, sid)
+                            st.rerun()
 
             # Summary
             if members:
