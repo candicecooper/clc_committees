@@ -242,10 +242,11 @@ def db_delete_scheduled(sched_id):
 
 # ─── COMMITTEE MEMBERS (from existing staff table) ───────────────────────────
 def db_get_all_staff():
-    """Load all active staff from the existing staff table."""
+    """Load all active staff from the staff_list table."""
     try:
-        result = supabase.table("staff")\
-            .select("id,name,email,role,program")\
+        result = supabase.table("staff_list")\
+            .select("id,name,email")\
+            .eq("active", True)\
             .order("name").execute()
         return result.data or []
     except Exception as e:
