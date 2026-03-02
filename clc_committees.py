@@ -4,6 +4,13 @@ from datetime import date, datetime, timedelta
 import json
 import base64
 import requests
+import smtplib
+import ssl
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email.mime.base import MIMEBase
+from email import encoders
+from email.utils import formatdate
 
 # ─── PAGE CONFIG ─────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -232,6 +239,227 @@ def db_save_scheduled(row):
 
 def db_delete_scheduled(sched_id):
     supabase.table("committee_scheduled_meetings").delete().eq("id", sched_id).execute()
+
+# ─── COMMITTEE MEMBERS (from existing staff table) ───────────────────────────
+def db_get_all_staff():
+    """Load all active staff from the existing staff table."""
+    try:
+        result = supabase.table("staff")\
+            .select("id,name,email,role,program")\
+            .order("name").execute()
+        return result.data or []
+    except Exception as e:
+        st.error(f"Could not load staff: {e}")
+        return []
+
+def db_get_committee_membership(committee):
+    """Get staff IDs assigned to this committee."""
+    try:
+        result = supabase.table("committee_membership")\
+            .select("staff_id,member_role")\
+            .eq("committee", committee).execute()
+        return {r["staff_id"]: r.get("member_role","Member") for r in (result.data or [])}
+    except:
+        return {}
+
+def db_set_committee_membership(committee, staff_id, member_role):
+    """Add a staff member to a committee."""
+    try:
+        supabase.table("committee_membership").upsert({
+            "committee": committee,
+            "staff_id": staff_id,
+            "member_role": member_role,
+        }, on_conflict="committee,staff_id").execute()
+    except Exception as e:
+        st.error(f"Could not update membership: {e}")
+
+def db_remove_committee_membership(committee, staff_id):
+    """Remove a staff member from a committee."""
+    supabase.table("committee_membership")\
+        .delete().eq("committee", committee).eq("staff_id", staff_id).execute()
+
+def db_get_members(committee):
+    """Get full staff details for committee members."""
+    try:
+        membership = db_get_committee_membership(committee)
+        if not membership:
+            return []
+        all_staff = db_get_all_staff()
+        members = []
+        for s in all_staff:
+            if s["id"] in membership:
+                members.append({
+                    "id":    s["id"],
+                    "name":  s["name"],
+                    "email": s["email"],
+                    "role":  membership[s["id"]],
+                })
+        return members
+    except:
+        return []
+
+# ─── ICS CALENDAR INVITE GENERATOR ──────────────────────────────────────────
+def make_ics(committee, meeting_date, meeting_time, location, meeting_type, organiser_email):
+    """Generate an .ics calendar invite file."""
+    try:
+        # Parse start datetime
+        time_str = meeting_time.strip() if meeting_time else "15:00"
+        # Try to parse common time formats
+        for fmt in ["%I:%M %p", "%I:%M%p", "%H:%M", "%I %p"]:
+            try:
+                t = datetime.strptime(time_str.upper(), fmt)
+                break
+            except:
+                t = datetime.strptime("15:00", "%H:%M")
+        dt_start = datetime.combine(meeting_date, t.time())
+        dt_end = dt_start + timedelta(hours=1)
+
+        uid = f"{committee.lower().replace(' ','-')}-{meeting_date}-{dt_start.strftime('%H%M')}@clc"
+        fmt_dt = lambda d: d.strftime("%Y%m%dT%H%M%S")
+
+        ics = f"""BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//CLC Committees//EN
+CALSCALE:GREGORIAN
+METHOD:REQUEST
+BEGIN:VEVENT
+UID:{uid}
+DTSTAMP:{datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")}
+DTSTART:{fmt_dt(dt_start)}
+DTEND:{fmt_dt(dt_end)}
+SUMMARY:{committee} Committee — {meeting_type} Meeting
+DESCRIPTION:You are invited to the {committee} Committee {meeting_type} Meeting at Cowandilla Learning Centre.
+LOCATION:{location or 'Cowandilla Learning Centre'}
+ORGANIZER:MAILTO:{organiser_email}
+STATUS:CONFIRMED
+SEQUENCE:0
+END:VEVENT
+END:VCALENDAR"""
+        return ics.encode("utf-8")
+    except Exception as e:
+        return None
+
+# ─── EMAIL SENDING ────────────────────────────────────────────────────────────
+def send_meeting_invites(committee, meeting_date, meeting_time, location,
+                          meeting_type, sender_name, recipients, agenda_items=None):
+    """Send meeting invite emails with ICS attachment to all recipients."""
+    cfg = COMMITTEES[committee]
+
+    # Use same [smtp] secrets format as staff meeting app
+    smtp_conf  = st.secrets.get("smtp", {})
+    smtp_host  = smtp_conf.get("host", "smtp.gmail.com")
+    smtp_port  = int(smtp_conf.get("port", 587))
+    smtp_user  = smtp_conf.get("user", "")
+    smtp_pass  = smtp_conf.get("password", "")
+    from_name  = smtp_conf.get("from_name", "CLC Committees")
+    from_email = smtp_user
+
+    if not smtp_user or not smtp_pass:
+        st.error("⚠️ Email not configured. Add [smtp] section to your Streamlit secrets.")
+        return 0, []
+
+    date_str = fmt_date(meeting_date)
+    time_str = f" at {meeting_time}" if meeting_time else ""
+    loc_str  = f" — {location}" if location else ""
+
+    # Build agenda HTML
+    agenda_html = ""
+    if agenda_items:
+        items_html = "".join(f"<li>{item.get('title','')}</li>" for item in agenda_items if item.get('title'))
+        if items_html:
+            agenda_html = f"""
+            <div style="margin-top:16px;">
+              <strong style="color:#1a2e44;">Proposed Agenda Items:</strong>
+              <ul style="margin:8px 0;padding-left:20px;color:#374151;">{items_html}</ul>
+            </div>"""
+
+    # ICS attachment
+    ics_data = make_ics(committee, meeting_date, meeting_time, location, meeting_type, from_email)
+
+    sent_to = []
+    errors = []
+
+    try:
+        context = ssl.create_default_context()
+        with smtplib.SMTP(smtp_host, smtp_port) as server:
+            server.ehlo()
+            server.starttls(context=context)
+            server.login(smtp_user, smtp_pass)
+
+            for recipient in recipients:
+                name  = recipient.get("name","")
+                email = recipient.get("email","")
+                if not email or "@" not in email:
+                    continue
+
+                msg = MIMEMultipart("mixed")
+                msg["From"]    = f"{sender_name} <{from_email}>"
+                msg["To"]      = f"{name} <{email}>" if name else email
+                msg["Subject"] = f"📅 {committee} Committee — {meeting_type} Meeting | {date_str}"
+                msg["Date"]    = formatdate(localtime=True)
+
+                html_body = f"""
+<html><body style="font-family:'Segoe UI',Arial,sans-serif;color:#222;max-width:600px;margin:0 auto;">
+  <div style="background:linear-gradient(135deg,{cfg['color']},{cfg['color']}cc);
+              color:white;padding:24px 28px;border-radius:12px 12px 0 0;">
+    <div style="font-size:2rem;">{cfg['emoji']}</div>
+    <h2 style="margin:8px 0 4px;font-size:1.3rem;">{committee} Committee</h2>
+    <p style="margin:0;opacity:0.85;font-size:0.9rem;">Meeting Invitation — Cowandilla Learning Centre</p>
+  </div>
+  <div style="background:white;border:1px solid #e5e7eb;border-top:none;
+              padding:24px 28px;border-radius:0 0 12px 12px;">
+    <p style="font-size:1rem;color:#374151;">Dear {name or 'Committee Member'},</p>
+    <p style="color:#374151;">You are invited to the following committee meeting:</p>
+
+    <div style="background:{cfg['bg']};border-left:4px solid {cfg['color']};
+                border-radius:8px;padding:16px 20px;margin:16px 0;">
+      <div style="font-size:1.1rem;font-weight:700;color:{cfg['color']};">
+        {committee} Committee — {meeting_type} Meeting
+      </div>
+      <div style="margin-top:10px;font-size:0.95rem;color:#374151;">
+        <div>📅 <strong>Date:</strong> {date_str}</div>
+        {f'<div>⏰ <strong>Time:</strong> {meeting_time}</div>' if meeting_time else ''}
+        {f'<div>📍 <strong>Location:</strong> {location}</div>' if location else ''}
+      </div>
+    </div>
+
+    {agenda_html}
+
+    <p style="color:#374151;margin-top:16px;">
+      A calendar invite is attached. Please accept to add this to your calendar.
+    </p>
+    <p style="color:#374151;">
+      If you are unable to attend, please send your apologies to {sender_name}.
+    </p>
+
+    <hr style="border:none;border-top:1px solid #e5e7eb;margin:20px 0;">
+    <p style="font-size:0.78rem;color:#9ca3af;margin:0;">
+      Sent via CLC Committee Management System · Cowandilla Learning Centre
+    </p>
+  </div>
+</body></html>"""
+
+                msg.attach(MIMEText(html_body, "html"))
+
+                # Attach ICS
+                if ics_data:
+                    ics_part = MIMEBase("text", "calendar", method="REQUEST", name="invite.ics")
+                    ics_part.set_payload(ics_data)
+                    encoders.encode_base64(ics_part)
+                    ics_part.add_header("Content-Disposition", "attachment", filename="invite.ics")
+                    msg.attach(ics_part)
+
+                try:
+                    server.sendmail(from_email, email, msg.as_string())
+                    sent_to.append(f"{name} <{email}>")
+                except Exception as e:
+                    errors.append(f"{email}: {e}")
+
+    except Exception as e:
+        st.error(f"SMTP connection error: {e}")
+        return 0, errors
+
+    return len(sent_to), errors
 
 # Calendar integration
 def post_to_calendar(committee, meeting_date, meeting_time, location, meeting_type, added_by):
@@ -945,102 +1173,283 @@ def render_schedule_tab(committee):
     upcoming = db_scheduled_meetings(committee)
     all_sched = db_all_scheduled(committee)
     past = [s for s in all_sched if str(s.get("meeting_date","")) < str(today)]
+    members = db_get_members(committee)
 
-    # Next meeting display
-    if upcoming:
-        nm = upcoming[0]
+    tab_sched, tab_members = st.tabs(["📅 Meetings", "👥 Members & Emails"])
+
+    # ══════════════ MEETINGS ══════════════
+    with tab_sched:
+        # Next meeting display
+        if upcoming:
+            nm = upcoming[0]
+            invite_tags = ""
+            if nm.get("invites_sent"):
+                invite_tags = f'&nbsp;·&nbsp;<span style="color:#7c3aed;">✉️ Invites sent</span>'
+            st.markdown(f"""
+            <div style="background:{cfg['bg']};border:2px solid {cfg['border']};
+                        border-radius:14px;padding:1.5rem;margin-bottom:1.25rem;">
+              <div style="font-size:0.75rem;font-weight:700;color:{cfg['color']};
+                          text-transform:uppercase;letter-spacing:0.06em;">Next Scheduled Meeting</div>
+              <div style="font-size:1.5rem;font-weight:800;color:{cfg['color']};margin-top:0.3rem;">
+                📅 {fmt_date(nm.get('meeting_date'))}
+              </div>
+              <div style="font-size:0.88rem;color:#555;margin-top:0.25rem;">
+                {f"⏰ {nm.get('meeting_time')}" if nm.get('meeting_time') else ""}
+                {f" &nbsp;📍 {nm.get('location')}" if nm.get('location') else ""}
+                {f" &nbsp;📋 {nm.get('meeting_type','Ordinary')}" if nm.get('meeting_type') else ""}
+              </div>
+              <div style="margin-top:0.5rem;font-size:0.78rem;color:#888;">
+                {"✅ Added to calendar" if nm.get("added_to_calendar") else ""}
+                {"&nbsp;·&nbsp;" if nm.get("added_to_calendar") and nm.get("added_to_bulletin") else ""}
+                {"📋 Added to bulletin" if nm.get("added_to_bulletin") else ""}
+                {invite_tags}
+              </div>
+            </div>
+            """, unsafe_allow_html=True)
+
+            if len(upcoming) > 1:
+                with st.expander(f"📅 {len(upcoming)-1} more upcoming meeting(s)"):
+                    for m in upcoming[1:]:
+                        st.markdown(f"- **{fmt_date(m.get('meeting_date'))}**"
+                                   + (f" at {m.get('meeting_time')}" if m.get('meeting_time') else "")
+                                   + (f" — {m.get('location')}" if m.get('location') else ""))
+        else:
+            st.markdown("""
+            <div style="background:#f8fafc;border:2px dashed #cbd5e1;border-radius:12px;
+                        padding:1.5rem;text-align:center;margin-bottom:1.25rem;color:#64748b;">
+              📅 No upcoming meetings scheduled — add one below.
+            </div>
+            """, unsafe_allow_html=True)
+
+        # Schedule new meeting
+        with st.expander("➕ Schedule a New Meeting", expanded=not upcoming):
+            if not members:
+                st.markdown("""
+                <div style="background:#fef3c7;border:1px solid #fcd34d;border-radius:8px;
+                            padding:0.6rem 0.9rem;font-size:0.84rem;color:#92400e;margin-bottom:0.75rem;">
+                  💡 Add committee members in the <strong>Members & Emails</strong> tab to send invites when scheduling.
+                </div>
+                """, unsafe_allow_html=True)
+
+            with st.form("schedule_meeting", clear_on_submit=True):
+                sc1, sc2 = st.columns(2)
+                with sc1:
+                    s_date = st.date_input("Meeting date *", value=today + timedelta(weeks=4))
+                    s_type = st.selectbox("Meeting type", ["Ordinary","Special","Extraordinary","Annual"])
+                    s_time = st.text_input("Time", placeholder="e.g. 3:30 PM")
+                with sc2:
+                    s_loc  = st.text_input("Location", placeholder="e.g. Staff Room")
+                    s_by   = st.text_input("Scheduled by *", placeholder="Your name")
+                    s_email = st.text_input("Your email (for invite sender)", placeholder="you@schools.sa.edu.au")
+
+                # Integration options
+                st.markdown("**Add to:**")
+                ic1, ic2, ic3 = st.columns(3)
+                with ic1: add_cal = st.checkbox("📅 Communal Calendar", value=True)
+                with ic2: add_bul = st.checkbox("📋 Daily Bulletin", value=True)
+                with ic3: send_invites = st.checkbox("✉️ Email Invites", value=bool(members))
+
+                # Member selection for invites
+                if members and send_invites:
+                    st.markdown("**Select recipients:**")
+                    member_checks = {}
+                    mcols = st.columns(min(len(members), 3))
+                    for i, m in enumerate(members):
+                        with mcols[i % len(mcols)]:
+                            member_checks[m["id"]] = st.checkbox(
+                                f"{m['name']} ({m['email']})",
+                                value=True,
+                                key=f"invite_{m['id']}"
+                            )
+
+                # Agenda preview for invite
+                pending_items = db_agenda_items(committee)
+                pending_items = [i for i in pending_items if i.get("status","pending") == "pending"]
+                include_agenda = False
+                if pending_items:
+                    include_agenda = st.checkbox(
+                        f"📋 Include {len(pending_items)} pending agenda item(s) in invite",
+                        value=True
+                    )
+
+                if st.form_submit_button("📅 Schedule Meeting", type="primary", use_container_width=True):
+                    if not s_by.strip():
+                        st.warning("Please enter your name.")
+                    else:
+                        cal_ok = bul_ok = False
+                        if add_cal:
+                            cal_ok = post_to_calendar(committee, s_date, s_time, s_loc, s_type, s_by)
+                        if add_bul:
+                            bul_ok = post_to_bulletin(committee, s_date, s_time, s_loc, s_type, s_by)
+
+                        # Send email invites
+                        invite_count = 0
+                        invite_errors = []
+                        if send_invites and members:
+                            selected = [m for m in members if member_checks.get(m["id"], False)]
+                            if selected:
+                                agenda_to_send = pending_items if include_agenda else None
+                                with st.spinner(f"Sending invites to {len(selected)} recipient(s)..."):
+                                    invite_count, invite_errors = send_meeting_invites(
+                                        committee, s_date, s_time, s_loc, s_type,
+                                        s_by, selected, agenda_to_send
+                                    )
+
+                        db_save_scheduled({
+                            "committee": committee,
+                            "meeting_date": str(s_date),
+                            "meeting_time": s_time.strip(),
+                            "location": s_loc.strip(),
+                            "meeting_type": s_type,
+                            "added_to_calendar": cal_ok,
+                            "added_to_bulletin": bul_ok,
+                            "invites_sent": invite_count,
+                            "created_by": s_by.strip(),
+                        })
+
+                        st.success(f"✅ Meeting scheduled for {fmt_date(s_date)}!")
+                        parts = []
+                        if add_cal: parts.append("📅 Calendar")
+                        if add_bul: parts.append("📋 Bulletin")
+                        if invite_count: parts.append(f"✉️ {invite_count} invite(s) sent")
+                        if parts: st.info(" · ".join(parts))
+                        if invite_errors:
+                            st.warning(f"⚠️ Failed to send to: {', '.join(invite_errors)}")
+                        st.rerun()
+
+        # Past meetings
+        if past:
+            with st.expander(f"📂 Past meetings ({len(past)})"):
+                for m in past:
+                    c1, c2 = st.columns([8,1])
+                    with c1:
+                        st.markdown(f"**{fmt_date(m.get('meeting_date'))}** — {m.get('meeting_type','Ordinary')}"
+                                   + (f" at {m.get('meeting_time')}" if m.get('meeting_time') else "")
+                                   + (f" · {m.get('location')}" if m.get('location') else "")
+                                   + (f" · ✉️ {m.get('invites_sent',0)} invites" if m.get('invites_sent') else ""))
+                    with c2:
+                        if st.session_state.is_admin:
+                            if st.button("🗑️", key=f"del_sched_{m['id']}"):
+                                db_delete_scheduled(m["id"])
+                                st.rerun()
+
+    # ══════════════ MEMBERS & EMAILS ══════════════
+    with tab_members:
+        cfg = COMMITTEES[committee]
+        all_staff   = db_get_all_staff()
+        membership  = db_get_committee_membership(committee)
+        members     = db_get_members(committee)
+
         st.markdown(f"""
-        <div style="background:{cfg['bg']};border:2px solid {cfg['border']};
-                    border-radius:14px;padding:1.5rem;margin-bottom:1.25rem;">
-          <div style="font-size:0.75rem;font-weight:700;color:{cfg['color']};
-                      text-transform:uppercase;letter-spacing:0.06em;">Next Scheduled Meeting</div>
-          <div style="font-size:1.5rem;font-weight:800;color:{cfg['color']};margin-top:0.3rem;">
-            📅 {fmt_date(nm.get('meeting_date'))}
-          </div>
-          <div style="font-size:0.88rem;color:#555;margin-top:0.25rem;">
-            {f"⏰ {fmt_time(nm.get('meeting_time'))}" if nm.get('meeting_time') else ""}
-            {f" &nbsp;📍 {nm.get('location')}" if nm.get('location') else ""}
-            {f" &nbsp;📋 {nm.get('meeting_type','Ordinary')}" if nm.get('meeting_type') else ""}
-          </div>
-          <div style="margin-top:0.5rem;font-size:0.78rem;color:#888;">
-            {'✅ Added to calendar' if nm.get('added_to_calendar') else ''}
-            {'&nbsp;·&nbsp;' if nm.get('added_to_calendar') and nm.get('added_to_bulletin') else ''}
-            {'📋 Added to bulletin' if nm.get('added_to_bulletin') else ''}
-          </div>
+        <div style="background:{cfg['bg']};border:1px solid {cfg['border']};border-radius:10px;
+                    padding:0.9rem 1.1rem;margin-bottom:1rem;font-size:0.85rem;color:{cfg['color']};">
+          Tick staff members below to add them to this committee.
+          When scheduling a meeting you can select exactly who receives an invite —
+          they'll get a branded email with an <strong>.ics calendar attachment</strong>.
         </div>
         """, unsafe_allow_html=True)
 
-        # Upcoming list if more than one
-        if len(upcoming) > 1:
-            with st.expander(f"📅 {len(upcoming)-1} more upcoming meeting(s)"):
-                for m in upcoming[1:]:
-                    st.markdown(f"- **{fmt_date(m.get('meeting_date'))}**"
-                               + (f" at {fmt_time(m.get('meeting_time'))}" if m.get('meeting_time') else "")
-                               + (f" — {m.get('location')}" if m.get('location') else ""))
-    else:
-        st.markdown(f"""
-        <div style="background:#f8fafc;border:2px dashed #cbd5e1;border-radius:12px;
-                    padding:1.5rem;text-align:center;margin-bottom:1.25rem;color:#64748b;">
-          📅 No upcoming meetings scheduled — add one below.
-        </div>
-        """, unsafe_allow_html=True)
+        if not all_staff:
+            st.markdown('<div class="info-box">No staff found in the system. Staff are managed in the main behaviour app.</div>', unsafe_allow_html=True)
+        else:
+            ROLE_COLORS = {
+                "Chair":        ("#1a2e44","#e8edf3"),
+                "Deputy Chair": ("#1d4ed8","#dbeafe"),
+                "Secretary":    ("#065f46","#d1fae5"),
+                "Member":       ("#374151","#f3f4f6"),
+                "Observer":     ("#6b7280","#f9fafb"),
+            }
+            ROLES = ["Member","Chair","Deputy Chair","Secretary","Observer"]
 
-    # Schedule new meeting
-    with st.expander("➕ Schedule a New Meeting", expanded=not upcoming):
-        with st.form("schedule_meeting", clear_on_submit=True):
-            sc1, sc2, sc3 = st.columns(3)
-            with sc1:
-                s_date = st.date_input("Meeting date *", value=today + timedelta(weeks=4))
-                s_type = st.selectbox("Meeting type", ["Ordinary","Special","Extraordinary","Annual"])
-            with sc2:
-                s_time = st.text_input("Time", placeholder="e.g. 3:30 PM")
-                s_loc  = st.text_input("Location", placeholder="e.g. Staff Room")
-            with sc3:
-                s_by   = st.text_input("Scheduled by *", placeholder="Your name")
-                add_cal = st.checkbox("📅 Add to Communal Calendar", value=True)
-                add_bul = st.checkbox("📋 Add to Daily Bulletin", value=True)
+            # Group staff by program for easier scanning
+            prog_order  = {"JP": "Junior Primary", "PY": "Primary Years",
+                           "SY": "Senior Years",   None: "Other / Leadership"}
+            by_prog = {}
+            for s in all_staff:
+                prog = s.get("program") or None
+                by_prog.setdefault(prog, []).append(s)
 
-            if st.form_submit_button("📅 Schedule Meeting", type="primary", use_container_width=True):
-                if not s_by.strip():
-                    st.warning("Please enter your name.")
-                else:
-                    cal_ok = bul_ok = False
-                    if add_cal:
-                        cal_ok = post_to_calendar(committee, s_date, s_time, s_loc, s_type, s_by)
-                    if add_bul:
-                        bul_ok = post_to_bulletin(committee, s_date, s_time, s_loc, s_type, s_by)
+            for prog_key in [None, "JP", "PY", "SY"]:
+                group = by_prog.get(prog_key, [])
+                if not group:
+                    continue
+                prog_label = prog_order.get(prog_key, prog_key or "Other")
+                st.markdown(f"**{prog_label}**")
+                for s in group:
+                    sid   = s["id"]
+                    sname = s["name"]
+                    semail= s.get("email","")
+                    is_member = sid in membership
+                    cur_role  = membership.get(sid, "Member")
+                    rc, rb = ROLE_COLORS.get(cur_role, ROLE_COLORS["Member"])
 
-                    db_save_scheduled({
-                        "committee": committee,
-                        "meeting_date": str(s_date),
-                        "meeting_time": s_time.strip(),
-                        "location": s_loc.strip(),
-                        "meeting_type": s_type,
-                        "added_to_calendar": cal_ok or add_cal,
-                        "added_to_bulletin": bul_ok or add_bul,
-                        "created_by": s_by.strip(),
-                    })
-                    st.success(f"✅ Meeting scheduled for {fmt_date(s_date)}!")
-                    parts = []
-                    if add_cal: parts.append("Communal Calendar")
-                    if add_bul: parts.append("Daily Bulletin")
-                    if parts: st.info(f"📅 Added to: {' & '.join(parts)}")
-                    st.rerun()
+                    col_check, col_info, col_role, col_save = st.columns([0.5, 4, 2, 1])
+                    with col_check:
+                        ticked = st.checkbox("", value=is_member,
+                                             key=f"mem_tick_{committee}_{sid}",
+                                             label_visibility="collapsed")
+                    with col_info:
+                        badge = f'<span style="background:{rb};color:{rc};font-size:0.68rem;font-weight:700;padding:0.1rem 0.45rem;border-radius:20px;">{cur_role}</span> ' if is_member else ""
+                        st.markdown(
+                            f'<div style="padding:0.35rem 0;font-size:0.88rem;">'
+                            f'{badge}<strong>{sname}</strong>'
+                            f'<span style="color:#888;font-size:0.78rem;margin-left:0.5rem;">✉️ {semail}</span>'
+                            f'</div>', unsafe_allow_html=True)
+                    with col_role:
+                        if ticked:
+                            new_role = st.selectbox("", ROLES,
+                                                    index=ROLES.index(cur_role) if cur_role in ROLES else 0,
+                                                    key=f"mem_role_{committee}_{sid}",
+                                                    label_visibility="collapsed")
+                        else:
+                            new_role = "Member"
+                            st.empty()
+                    with col_save:
+                        st.write("")
+                        if ticked and not is_member:
+                            if st.button("➕", key=f"mem_add_{committee}_{sid}", help=f"Add {sname}"):
+                                db_set_committee_membership(committee, sid, new_role)
+                                st.rerun()
+                        elif ticked and is_member and new_role != cur_role:
+                            if st.button("💾", key=f"mem_save_{committee}_{sid}", help="Save role"):
+                                db_set_committee_membership(committee, sid, new_role)
+                                st.rerun()
+                        elif not ticked and is_member:
+                            if st.button("✖", key=f"mem_rem_{committee}_{sid}", help=f"Remove {sname}"):
+                                db_remove_committee_membership(committee, sid)
+                                st.rerun()
 
-    # Past meetings
-    if past:
-        with st.expander(f"📂 Past meetings ({len(past)})"):
-            for m in past:
-                c1, c2 = st.columns([8,1])
-                with c1:
-                    st.markdown(f"**{fmt_date(m.get('meeting_date'))}** — {m.get('meeting_type','Ordinary')}"
-                               + (f" at {fmt_time(m.get('meeting_time'))}" if m.get('meeting_time') else "")
-                               + (f" · {m.get('location')}" if m.get('location') else ""))
-                with c2:
-                    if st.session_state.is_admin:
-                        if st.button("🗑️", key=f"del_sched_{m['id']}"):
-                            db_delete_scheduled(m["id"])
-                            st.rerun()
+            # Summary
+            if members:
+                st.markdown("---")
+                names = ", ".join(m["name"] for m in members)
+                st.markdown(f"**{len(members)} member{'s' if len(members)!=1 else ''} on this committee:** {names}")
+
+        # Email config status
+        st.markdown("---")
+        smtp_conf = st.secrets.get("smtp", {})
+        smtp_user = smtp_conf.get("user","")
+        smtp_host = smtp_conf.get("host","smtp.gmail.com")
+        if smtp_user:
+            st.markdown(f"""
+            <div style="background:#f0fdf4;border:1px solid #86efac;border-radius:8px;
+                        padding:0.6rem 0.9rem;font-size:0.83rem;color:#15803d;">
+              ✅ <strong>Email configured</strong> — sending via {smtp_user} ({smtp_host})
+            </div>
+            """, unsafe_allow_html=True)
+        else:
+            st.markdown("""
+            <div style="background:#fef3c7;border:1px solid #fcd34d;border-radius:8px;
+                        padding:0.6rem 0.9rem;font-size:0.83rem;color:#92400e;">
+              ⚠️ <strong>Email not configured.</strong> Add this to your Streamlit secrets:<br><br>
+              <code>[smtp]</code><br>
+              <code>host = "smtp.gmail.com"</code><br>
+              <code>port = 587</code><br>
+              <code>user = "clc.digitalstaffmeeting@gmail.com"</code><br>
+              <code>password = "your-16-char-app-password"</code><br>
+              <code>from_name = "CLC Committees"</code>
+            </div>
+            """, unsafe_allow_html=True)
 
 # ─── MAIN COMMITTEE VIEW ──────────────────────────────────────────────────────
 def render_committee(committee):
