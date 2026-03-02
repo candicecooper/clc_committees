@@ -21,6 +21,16 @@ supabase = init_supabase()
 
 # ─── COMMITTEE CONFIG ─────────────────────────────────────────────────────────
 COMMITTEES = {
+    "PAC": {
+        "emoji": "🏛️",
+        "color": "#1a2e44",
+        "bg":    "#e8edf3",
+        "border":"#7a9cbf",
+        "desc":  "Personnel Advisory Committee",
+        "password_key": "PAC_PASSWORD",
+        "default_pw":   "pac2026",
+        "members_default": ["Principal", "Staff Rep 1", "Staff Rep 2", "Community Rep"],
+    },
     "Finance": {
         "emoji": "💰",
         "color": "#065f46",
@@ -345,7 +355,8 @@ def landing_page():
     """, unsafe_allow_html=True)
 
     st.markdown("**Select a committee to continue:**")
-    cols = st.columns(3)
+    col1, col2 = st.columns(2)
+    cols = [col1, col2, col1, col2]
     for i, (name, cfg) in enumerate(COMMITTEES.items()):
         with cols[i]:
             st.markdown(f"""
