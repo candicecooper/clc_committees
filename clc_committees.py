@@ -128,9 +128,23 @@ hr { border: none; border-top: 1px solid #eaecf0; margin: 0.75rem 0; }
 
 # ─── SESSION STATE ────────────────────────────────────────────────────────────
 today = date.today()
+
+# Read ?committee= query param BEFORE setting session defaults so we never
+# render the landing page when arriving directly from the portal
+_qp_committee = None
+try:
+    _qp_committee = st.query_params.get("committee", None)
+except Exception:
+    try:
+        _qp_committee = st.experimental_get_query_params().get("committee", [None])[0]
+    except Exception:
+        pass
+if _qp_committee and _qp_committee not in COMMITTEES:
+    _qp_committee = None
+
 defaults = {
-    "selected_committee": None,
-    "auth": {},          # {committee: True/False}
+    "selected_committee": _qp_committee,   # pre-set from URL if present
+    "auth": {},
     "is_admin": False,
     "edit_minutes_id": None,
     "ai_result": None,
@@ -138,6 +152,15 @@ defaults = {
 for k, v in defaults.items():
     if k not in st.session_state:
         st.session_state[k] = v
+# Override if URL has a committee and session hasn't been set yet to something else
+if _qp_committee and st.session_state.selected_committee is None:
+    st.session_state.selected_committee = _qp_committee
+# Clear query param so back-button works cleanly
+if _qp_committee:
+    try:
+        st.query_params.clear()
+    except Exception:
+        pass
 
 # ─── HELPERS ──────────────────────────────────────────────────────────────────
 def get_pw(committee):
@@ -1495,6 +1518,7 @@ def render_committee(committee):
         render_schedule_tab(committee)
 
 # ─── MAIN ROUTER ──────────────────────────────────────────────────────────────
+# Read ?committee= query param from portal link — skip landing page if set
 committee = st.session_state.selected_committee
 
 if committee is None:
